@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+/credentials.json
+client_secret*.json
+token*.json
+/vystup/
+*.xlsx
