@@ -33,7 +33,7 @@ Program běží na vašem počítači. Internet potřebuje pro přihlášení, v
 
 ## Výstup
 
-Každý běh vytvoří vlastní adresář pod `vystup/` a vypíše cestu k `prehled.html`. Přehled otevřete v prohlížeči. Obsahuje barevnou časovou osu a součty v hodinách. Vedle něj jsou `hodiny.csv` se součty a `intervaly.csv` s intervaly, jejich hodnotami a délkou. CSV používají UTF‑8, středník a desetinnou čárku.
+Každý výpočet vytvoří vlastní adresář pod `vystup/` a vypíše cestu k `prehled.html`. Přehled otevřete v prohlížeči. Obsahuje barevnou časovou osu a součty v hodinách. Vedle něj jsou `hodiny.csv` se součty a `intervaly.csv` s intervaly, jejich hodnotami a délkou. CSV používají UTF‑8, středník a desetinnou čárku.
 
 Výpočet vezme poslední dostupnou revizi nejpozději na začátku období a projde dostupné revize uvnitř období. Hodnota ze snímku se počítá od času jeho revize do další zaznamenané změny nebo do konce období. Řádky se párují podle názvu bodu. U názvů a hodnot se ignoruje velikost písmen a nadbytečné mezery.
 
@@ -41,9 +41,31 @@ Sloupec **Nezjištěno** pokrývá dobu před prvním dostupným snímkem, chyb�
 
 Google může revize sloučit nebo některé přes API nevrátit. Součty jsou rekonstrukce ze snímků, a proto se mohou lišit od času skutečných změn. Program používá [Drive API pro výpis revizí](https://developers.google.com/workspace/drive/api/reference/rest/v3/revisions/list) a [export konkrétní revize do XLSX](https://developers.google.com/workspace/drive/api/guides/manage-downloads#export_google_workspace_document_content_using_long-running_operations).
 
-## Výpočet z místních souborů
+## Stažení a výpočet ve dvou krocích
 
-Připravte CSV v UTF‑8 s časem pořízení a cestou ke každému XLSX snímku. Relativní cesty se vyhodnocují vůči umístění CSV.
+Přepínač `--stahnout` uloží každou dostupnou revizi pro zadané období a výchozí revizi. Výchozím formátem je CSV se sloupci **NÁZEV BODU** a **STRANA** z listu **Pochůzky BODY**. Program stáhne XLSX z Drive a převede jej na CSV lokálně, protože export CSV přímo z Drive obsahuje jen první list.
+
+```powershell
+python pochuzky.py --od 2026-11-15 --do 2026-11-22 --stahnout
+```
+
+Chcete-li uložit všechny listy v každé revizi, použijte `--stahnout xlsx`. Soubory budou v nové složce uvnitř systémové dočasné složky (na Windows pod `%TEMP%`). Pokud je chcete mít dlouhodobě, přesuňte celou vytvořenou složku jinam.
+
+```powershell
+python pochuzky.py --od 2026-11-15 --do 2026-11-22 --stahnout xlsx
+```
+
+Obě varianty vypíšou cestu k `snimky.csv`. Z ní pak vytvoříte report bez připojení ke Googlu. Zadejte původní období nebo jeho část a použijte vypsanou cestu.
+
+```powershell
+python pochuzky.py --od 2026-11-15 --do 2026-11-22 --snimky "C:\cesta\k\snimky.csv"
+```
+
+Bez přepínačů `--stahnout` a `--snimky` se stažení a výpočet provedou v jednom běhu.
+
+## Výpočet z vlastních XLSX souborů
+
+Připravte seznam v CSV v UTF‑8 s časem pořízení a cestou ke každému XLSX snímku. Relativní cesty se vyhodnocují vůči umístění CSV.
 
 ```csv
 cas;soubor

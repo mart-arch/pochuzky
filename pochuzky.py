@@ -2,10 +2,12 @@
 
 import argparse
 import csv
+import json
 import sys
 import tempfile
 import unicodedata
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -20,6 +22,10 @@ from openpyxl.utils.exceptions import InvalidFileException
 
 
 SHEET = "Pochůzky BODY"
+SNAPSHOT_COLUMNS = ("NÁZEV BODU", "STRANA")
+OUTPUT = Path("vystup")
+MANIFEST = "snimky.csv"
+PERIOD = "obdobi.json"
 POINTS = (
     "Vyšehrad, u štábu NH", "Palmovka", "Pankrác", "Skalka",
     "CENTRAL PARK  - Hůrka", "Strahov Silicon hill", "Park u Kolbenovy",
@@ -78,7 +84,7 @@ def read_snapshot(content):
         if SHEET not in book.sheetnames:
             raise ValueError(f"Chybí list {SHEET!r}.")
         rows = book[SHEET].iter_rows()
-        for row in rows:
+        for header_row, row in enumerate(rows, 1):
             values = [key(cell.value) for cell in row]
             if "název bodu" in values and "strana" in values:
                 name_col, side_col = values.index("název bodu"), values.index("strana")
@@ -86,26 +92,47 @@ def read_snapshot(content):
         else:
             raise ValueError("Chybí záhlaví NÁZEV BODU a STRANA na stejném řádku.")
 
-        states = {}
-        for row in rows:
-            if name_col >= len(row):
-                continue
-            point = POINT_NAMES.get(key(row[name_col].value))
-            if point is None:
-                continue
-            if point in states:
-                raise ValueError(f"Bod {point!r} je v listu vícekrát.")
-            cell = row[side_col] if side_col < len(row) else None
-            value = cell.value if cell is not None else None
-            if value is None:
-                states[point] = ""
-            elif key(value) in SIDES:
-                states[point] = SIDES[key(value)]
-            else:
-                raise ValueError(f"Bod {point!r} má neplatnou hodnotu ve sloupci STRANA ({cell.coordinate}).")
-        return states
+        return read_states(
+            (row[name_col].value, row[side_col].value if side_col < len(row) else None, f"řádek {number}")
+            for number, row in enumerate(rows, header_row + 1)
+            if name_col < len(row)
+        )
     finally:
         book.close()
+
+
+def read_states(rows):
+    states = {}
+    for name, value, location in rows:
+        point = POINT_NAMES.get(key(name))
+        if point is None:
+            continue
+        if point in states:
+            raise ValueError(f"Bod {point!r} je ve snímku vícekrát ({location}).")
+        side = "" if value is None else key(value)
+        if side not in SIDES:
+            raise ValueError(f"Bod {point!r} má neplatnou hodnotu ve sloupci STRANA ({location}).")
+        states[point] = SIDES[side]
+    return states
+
+
+def read_local_snapshot(source):
+    path = Path(source)
+    if path.suffix.lower() == ".xlsx":
+        return read_snapshot(path.read_bytes())
+    if path.suffix.lower() != ".csv":
+        raise ValueError("Snímek musí být ve formátu CSV nebo XLSX.")
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream, delimiter=";", strict=True)
+        if tuple(next(reader, ())) != SNAPSHOT_COLUMNS:
+            raise ValueError("Chybí záhlaví NÁZEV BODU;STRANA.")
+
+        def entries():
+            for number, row in enumerate(reader, 2):
+                if len(row) != 2:
+                    raise ValueError(f"Snímek má na řádku {number} jiný počet sloupců než dva.")
+                yield (*row, f"řádek {number}")
+        return read_states(entries())
 
 
 def read_manifest(path):
@@ -119,13 +146,25 @@ def read_manifest(path):
             yield Revision(parse_time(row["cas"].strip()), str(path.parent / row["soubor"].strip()))
 
 
-def intervals(revisions, read, start, end):
+def select_revisions(revisions, start, end):
     """Use the last snapshot at/before start and the snapshots inside [start, end)."""
     earlier = max((item.time for item in revisions if item.time <= start), default=None)
     selected = sorted(
         (item for item in revisions if item.time == earlier or start < item.time < end),
         key=lambda item: item.time,
     )
+    return selected, earlier
+
+
+def read_revision(rev, read):
+    try:
+        return read(rev.source)
+    except (BadZipFile, InvalidFileException, OSError, ValueError, RuntimeError, csv.Error) as error:
+        raise ValueError(f"Snímek {rev.source} v {local_time(rev.time)}: {error}") from error
+
+
+def intervals(revisions, read, start, end):
+    selected, earlier = select_revisions(revisions, start, end)
     timeline = {point: [] for point in POINTS}
     states = {}
     cursor = start
@@ -142,12 +181,7 @@ def intervals(revisions, read, start, end):
 
     for time, group in groupby(selected, key=lambda item: item.time):
         add_until(time)
-        alternatives = []
-        for rev in group:
-            try:
-                alternatives.append(read_snapshot(read(rev.source)))
-            except (BadZipFile, InvalidFileException, OSError, ValueError, RuntimeError) as error:
-                raise ValueError(f"Snímek {rev.source} v {local_time(time)}: {error}") from error
+        alternatives = [read_revision(rev, read) for rev in group]
         states = {}
         for point in POINTS:
             observed = {snapshot.get(point) for snapshot in alternatives}
@@ -159,6 +193,61 @@ def intervals(revisions, read, start, end):
 
 def local_time(time):
     return time.astimezone(PRAGUE).isoformat(sep=" ", timespec="auto")
+
+
+@contextmanager
+def stage_output(root, prefix=""):
+    root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".pochuzky-", dir=root) as temporary:
+        directory = Path(temporary)
+        staged = directory / "obsah"
+        staged.mkdir(mode=0o700)
+        target = root / (prefix + directory.name.removeprefix(".pochuzky-"))
+        yield staged, target
+        staged.rename(target)
+
+
+def save_snapshots(revisions, download, start, end, snapshot_format):
+    selected, _ = select_revisions(revisions, start, end)
+    full_workbooks = snapshot_format == "xlsx"
+    root = Path(tempfile.gettempdir()) if full_workbooks else OUTPUT
+    prefix = "pochuzky-snimky-" if full_workbooks else "snimky-"
+    with stage_output(root, prefix) as (staged, target):
+        with (staged / MANIFEST).open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.writer(stream, delimiter=";")
+            writer.writerow(("cas", "soubor"))
+            for number, rev in enumerate(selected, 1):
+                name = f"revize-{number:05d}.{snapshot_format}"
+                path = staged / name
+                if full_workbooks:
+                    path.write_bytes(read_revision(rev, download))
+                else:
+                    states = read_revision(rev, lambda source: read_snapshot(download(source)))
+                    with path.open("w", encoding="utf-8-sig", newline="") as snapshot:
+                        rows = csv.writer(snapshot, delimiter=";")
+                        rows.writerow(SNAPSHOT_COLUMNS)
+                        rows.writerows(states.items())
+                writer.writerow((rev.time.isoformat(), name))
+        (staged / PERIOD).write_text(
+            json.dumps({"od": start.isoformat(), "do": end.isoformat()}) + "\n",
+            encoding="utf-8",
+        )
+    return target / MANIFEST, len(selected)
+
+
+def check_saved_period(manifest, start, end):
+    if manifest.name != MANIFEST:
+        return
+    path = manifest.with_name(PERIOD)
+    if not path.is_file():
+        return
+    try:
+        period = json.loads(path.read_text(encoding="utf-8"))
+        saved_start, saved_end = parse_time(period["od"]), parse_time(period["do"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Neplatné období uložené v {path}.") from error
+    if not saved_start <= start < end <= saved_end:
+        raise ValueError(f"Stažené snímky pokrývají období {local_time(saved_start)} až {local_time(saved_end)}.")
 
 
 def write_report(directory, timeline, start, end, count, baseline):
@@ -239,16 +328,23 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--od", required=True, help="Začátek období včetně, datum nebo čas ISO.")
     parser.add_argument("--do", required=True, help="Konec období bez tohoto okamžiku.")
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--oauth", type=Path, help="JSON s OAuth klientem. Výchozí: credentials.json.")
-    source.add_argument("--snimky", type=Path, help="Místní seznam XLSX snímků v CSV (cas;soubor).")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--stahnout", nargs="?", const="csv", choices=("csv", "xlsx"),
+        help="Pouze stáhne snímky. Výchozí formát je CSV, volba xlsx uloží celý sešit.",
+    )
+    mode.add_argument("--snimky", type=Path, help="Zpracuje místní seznam CSV nebo XLSX snímků (cas;soubor).")
+    parser.add_argument("--oauth", type=Path, help="JSON s OAuth klientem. Výchozí: credentials.json.")
     args = parser.parse_args(argv)
+    if args.snimky and args.oauth:
+        parser.error("--oauth nelze použít s místními snímky.")
     try:
         start, end = parse_time(args.od), parse_time(args.do)
         if start >= end:
             raise ValueError("Začátek období musí předcházet konci.")
         if args.snimky:
-            result = intervals(list(read_manifest(args.snimky)), lambda file: Path(file).read_bytes(), start, end)
+            check_saved_period(args.snimky, start, end)
+            result = intervals(list(read_manifest(args.snimky)), read_local_snapshot, start, end)
         else:
             from drive import connect
 
@@ -260,17 +356,18 @@ def main(argv=None):
                     Revision(parse_time(time), revision_id)
                     for revision_id, time in drive.revisions().items()
                 ]
-                result = intervals(revisions, drive.download, start, end)
+                if args.stahnout:
+                    manifest, count = save_snapshots(revisions, drive.download, start, end, args.stahnout)
+                    print(f"Stažené snímky: {count}")
+                    print(f"Seznam snímků: {manifest.resolve()}")
+                    if count == 0:
+                        print("Drive nevrátil žádné dostupné revize pro zadané období.", file=sys.stderr)
+                    return 0
+                result = intervals(revisions, lambda source: read_snapshot(drive.download(source)), start, end)
 
         timeline, count, baseline = result
-        root = Path("vystup")
-        root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".vypocet-", dir=root) as temporary:
-            staged = Path(temporary) / "report"
-            staged.mkdir()
+        with stage_output(OUTPUT) as (staged, target):
             write_report(staged, timeline, start, end, count, baseline)
-            target = root / Path(temporary).name.removeprefix(".vypocet-")
-            staged.rename(target)
         print(f"Přehled: {(target / 'prehled.html').resolve()}")
         if baseline is None:
             print("Pro začátek období chybí výchozí snímek.", file=sys.stderr)
@@ -278,7 +375,7 @@ def main(argv=None):
     except ModuleNotFoundError as error:
         print(f"Chybí závislost {error.name}. Spusťte python -m pip install -r requirements.txt.", file=sys.stderr)
         return 1
-    except (ValueError, RuntimeError, OSError) as error:
+    except (ValueError, RuntimeError, OSError, csv.Error) as error:
         print(f"Chyba: {error}", file=sys.stderr)
         return 1
 
