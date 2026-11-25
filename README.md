@@ -63,6 +63,16 @@ python pochuzky.py --od 2026-11-15 --do 2026-11-22 --snimky "C:\cesta\k\snimky.c
 
 Bez přepínačů `--stahnout` a `--snimky` se stažení a výpočet provedou v jednom běhu.
 
+## Pokračování po přerušení stahování
+
+Mezi stahováním jednotlivých revizí program čeká náhodně 1–10 sekund. Každý hotový snímek ukládá ihned, a to i při přímém výpočtu reportu. Před stahováním vypíše cestu ke složce se snímky.
+
+Po přerušení nebo chybě HTTP 429 spusťte původní příkaz se stejným obdobím a formátem a přidejte `--navazat` s vypsanou cestou ke složce. Program přeskočí uložené snímky a stáhne zbývající revize z původního seznamu.
+
+```powershell
+python pochuzky.py --od 2026-11-15 --do 2026-11-22 --stahnout --navazat "vystup/snimky-abc123"
+```
+
 ## Výpočet z vlastních XLSX souborů
 
 Připravte seznam v CSV v UTF‑8 s časem pořízení a cestou ke každému XLSX snímku. Relativní cesty se vyhodnocují vůči umístění CSV.

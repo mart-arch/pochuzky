@@ -7,13 +7,15 @@ import sys
 import tempfile
 import unicodedata
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
 from itertools import groupby
 from pathlib import Path
+from random import uniform
+from time import sleep
 from zipfile import BadZipFile
 from zoneinfo import ZoneInfo
 
@@ -207,32 +209,90 @@ def stage_output(root, prefix=""):
         staged.rename(target)
 
 
-def save_snapshots(revisions, download, start, end, snapshot_format):
+@contextmanager
+def atomic_output(path):
+    with tempfile.TemporaryDirectory(prefix=".pochuzky-", dir=path.parent) as temporary:
+        staged = Path(temporary) / path.name
+        yield staged
+        staged.replace(path)
+
+
+def start_download(revisions, start, end, snapshot_format):
     selected, _ = select_revisions(revisions, start, end)
     full_workbooks = snapshot_format == "xlsx"
     root = Path(tempfile.gettempdir()) if full_workbooks else OUTPUT
     prefix = "pochuzky-snimky-" if full_workbooks else "snimky-"
-    with stage_output(root, prefix) as (staged, target):
-        with (staged / MANIFEST).open("w", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.writer(stream, delimiter=";")
-            writer.writerow(("cas", "soubor"))
-            for number, rev in enumerate(selected, 1):
-                name = f"revize-{number:05d}.{snapshot_format}"
-                path = staged / name
-                if full_workbooks:
-                    path.write_bytes(read_revision(rev, download))
+    root.mkdir(exist_ok=True)
+    target = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+    plan = {
+        "od": start.isoformat(), "do": end.isoformat(), "format": snapshot_format,
+        "revize": [(rev.time.isoformat(), rev.source) for rev in selected],
+    }
+    with atomic_output(target / PERIOD) as path:
+        path.write_text(json.dumps(plan) + "\n", encoding="utf-8")
+    return target, selected
+
+
+def read_download_plan(target, start, end, snapshot_format):
+    path = target / PERIOD
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        saved_start, saved_end = parse_time(plan["od"]), parse_time(plan["do"])
+        saved_format = plan["format"]
+        selected = [Revision(parse_time(time), source) for time, source in plan["revize"]]
+        if not all(isinstance(rev.source, str) and rev.source for rev in selected):
+            raise ValueError("Chybí identifikátor revize.")
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise ValueError(f"Nelze načíst údaje pro navázání z {path}: {error}") from error
+    if (saved_start, saved_end, saved_format) != (start, end, snapshot_format):
+        raise ValueError("Pro navázání zadejte stejné období a formát snímků jako při prvním spuštění.")
+    return selected
+
+
+def save_snapshots(start, end, snapshot_format, oauth, resume):
+    from drive import connect
+
+    with ExitStack() as stack:
+        drive = None
+        if resume is None:
+            drive = stack.enter_context(connect(oauth))
+            revisions = [Revision(parse_time(time), source) for source, time in drive.revisions().items()]
+            target, selected = start_download(revisions, start, end, snapshot_format)
+        else:
+            target = resume
+            selected = read_download_plan(target, start, end, snapshot_format)
+
+        print(f'Pro případné navázání použijte --navazat "{target.resolve()}".', file=sys.stderr, flush=True)
+        snapshots = []
+        downloaded = False
+        for number, rev in enumerate(selected, 1):
+            name = f"revize-{number:05d}.{snapshot_format}"
+            path = target / name
+            snapshots.append((rev.time.isoformat(), name))
+            if path.is_file():
+                continue
+            if drive is None:
+                drive = stack.enter_context(connect(oauth))
+            if downloaded:
+                sleep(uniform(1, 10))
+            with atomic_output(path) as staged:
+                if snapshot_format == "xlsx":
+                    staged.write_bytes(read_revision(rev, drive.download))
                 else:
-                    states = read_revision(rev, lambda source: read_snapshot(download(source)))
-                    with path.open("w", encoding="utf-8-sig", newline="") as snapshot:
-                        rows = csv.writer(snapshot, delimiter=";")
+                    states = read_revision(rev, lambda source: read_snapshot(drive.download(source)))
+                    with staged.open("w", encoding="utf-8-sig", newline="") as stream:
+                        rows = csv.writer(stream, delimiter=";")
                         rows.writerow(SNAPSHOT_COLUMNS)
                         rows.writerows(states.items())
-                writer.writerow((rev.time.isoformat(), name))
-        (staged / PERIOD).write_text(
-            json.dumps({"od": start.isoformat(), "do": end.isoformat()}) + "\n",
-            encoding="utf-8",
-        )
-    return target / MANIFEST, len(selected)
+            downloaded = True
+
+    manifest = target / MANIFEST
+    with atomic_output(manifest) as staged:
+        with staged.open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.writer(stream, delimiter=";")
+            writer.writerow(("cas", "soubor"))
+            writer.writerows(snapshots)
+    return manifest, len(selected)
 
 
 def check_saved_period(manifest, start, end):
@@ -334,10 +394,13 @@ def main(argv=None):
         help="Pouze stáhne snímky. Výchozí formát je CSV, volba xlsx uloží celý sešit.",
     )
     mode.add_argument("--snimky", type=Path, help="Zpracuje místní seznam CSV nebo XLSX snímků (cas;soubor).")
+    parser.add_argument("--navazat", type=Path, help="Pokračuje ve stahování ve složce vypsané při prvním spuštění.")
     parser.add_argument("--oauth", type=Path, help="JSON s OAuth klientem. Výchozí: credentials.json.")
     args = parser.parse_args(argv)
     if args.snimky and args.oauth:
         parser.error("--oauth nelze použít s místními snímky.")
+    if args.snimky and args.navazat:
+        parser.error("--navazat nelze použít s --snimky.")
     try:
         start, end = parse_time(args.od), parse_time(args.do)
         if start >= end:
@@ -346,24 +409,19 @@ def main(argv=None):
             check_saved_period(args.snimky, start, end)
             result = intervals(list(read_manifest(args.snimky)), read_local_snapshot, start, end)
         else:
-            from drive import connect
-
             # Do not extrapolate into the future, including time spent authorizing.
             if end > datetime.now(UTC):
                 raise ValueError("Konec období pro historii z Google Drive nesmí být v budoucnosti.")
-            with connect(args.oauth or Path("credentials.json")) as drive:
-                revisions = [
-                    Revision(parse_time(time), revision_id)
-                    for revision_id, time in drive.revisions().items()
-                ]
-                if args.stahnout:
-                    manifest, count = save_snapshots(revisions, drive.download, start, end, args.stahnout)
-                    print(f"Stažené snímky: {count}")
-                    print(f"Seznam snímků: {manifest.resolve()}")
-                    if count == 0:
-                        print("Drive nevrátil žádné dostupné revize pro zadané období.", file=sys.stderr)
-                    return 0
-                result = intervals(revisions, lambda source: read_snapshot(drive.download(source)), start, end)
+            manifest, count = save_snapshots(
+                start, end, args.stahnout or "csv", args.oauth or Path("credentials.json"), args.navazat,
+            )
+            if args.stahnout:
+                print(f"Stažené snímky: {count}")
+                print(f"Seznam snímků: {manifest.resolve()}")
+                if count == 0:
+                    print("Drive nevrátil žádné dostupné revize pro zadané období.", file=sys.stderr)
+                return 0
+            result = intervals(list(read_manifest(manifest)), read_local_snapshot, start, end)
 
         timeline, count, baseline = result
         with stage_output(OUTPUT) as (staged, target):
@@ -372,6 +430,9 @@ def main(argv=None):
         if baseline is None:
             print("Pro začátek období chybí výchozí snímek.", file=sys.stderr)
         return 0
+    except KeyboardInterrupt:
+        print("Běh byl přerušen.", file=sys.stderr)
+        return 130
     except ModuleNotFoundError as error:
         print(f"Chybí závislost {error.name}. Spusťte python -m pip install -r requirements.txt.", file=sys.stderr)
         return 1
